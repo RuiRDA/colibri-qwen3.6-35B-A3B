@@ -1,4 +1,5 @@
 import json
+import os
 import struct
 import subprocess
 import sys
@@ -99,6 +100,7 @@ class DoctorTest(unittest.TestCase):
         self.assertIsNone(report["plan"])
         self.assertEqual(exit_code(report), 1)
 
+    @unittest.skipIf(os.name == "nt", "Windows does not preserve POSIX execute mode bits")
     def test_non_executable_engine_and_excessive_ram_budget_fail(self):
         self.engine.chmod(0o644)
         report = self.report(ram_gb=40)

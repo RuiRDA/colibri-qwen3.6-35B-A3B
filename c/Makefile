@@ -207,9 +207,15 @@ LDFLAGS  += -framework Metal -framework Foundation -lc++
 METAL_OBJ = backend_metal.o
 endif
 
-all: glm$(EXE)
+all: qwen36$(EXE)
 
 # phony 'glm' → 'glm.exe' on Windows (so 'make glm' and 'coli build' work on every platform)
+# Dedicated CPU-only Qwen3.6 hybrid-attention engine.
+qwen36: qwen36$(EXE)
+
+qwen36$(EXE): qwen36.c st.h json.h tok.h tok_unicode.h compat.h
+	$(CC) $(CFLAGS) qwen36.c -o qwen36$(EXE) $(LDFLAGS)
+
 glm: glm$(EXE)
 
 glm$(EXE): glm.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h $(CUDA_OBJ) $(METAL_OBJ)
@@ -323,11 +329,12 @@ check:
 	$(MAKE) portable
 	$(MAKE) test
 
-install: glm$(EXE) olmoe$(EXE)
+install: qwen36$(EXE) glm$(EXE) olmoe$(EXE)
 	$(INSTALL) -d $(DESTDIR)$(BINDIR)
 	$(INSTALL) -d $(DESTDIR)$(LIBEXECDIR)
 	$(INSTALL) -d $(DESTDIR)$(LIBEXECDIR)/tools
 	$(INSTALL) -m 755 coli $(DESTDIR)$(BINDIR)/coli
+	$(INSTALL) -m 755 qwen36$(EXE) $(DESTDIR)$(LIBEXECDIR)/qwen36$(EXE)
 	$(INSTALL) -m 755 glm$(EXE) $(DESTDIR)$(LIBEXECDIR)/glm$(EXE)
 	$(INSTALL) -m 755 olmoe$(EXE) $(DESTDIR)$(LIBEXECDIR)/olmoe$(EXE)
 	$(INSTALL) -m 644 resource_plan.py doctor.py openai_server.py $(DESTDIR)$(LIBEXECDIR)/
@@ -342,4 +349,4 @@ clean:
 
 bench: iobench$(EXE)
 	@if [ -n "$(ARGS)" ]; then ./iobench$(EXE) $(ARGS); else echo "built iobench$(EXE) — run: ./iobench$(EXE) <file> <MB> <iters> <threads> <direct 0|1>"; fi
-.PHONY: all glm cuda-test cuda-bench cuda-dll portable test-c test-python test check clean install uninstall bench
+.PHONY: all glm qwen36 cuda-test cuda-bench cuda-dll portable test-c test-python test check clean install uninstall bench

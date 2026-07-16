@@ -360,6 +360,30 @@ def render_chat(messages, enable_thinking=False, reasoning_effort=None, tools=No
                   "<|assistant|><think></think>")
     return "".join(prompt)
 
+def render_qwen_chat(messages, enable_thinking=False, reasoning_effort=None, tools=None,
+                     tool_choice=None):
+    """Render the text-only Qwen3.6 ChatML envelope."""
+    if not isinstance(messages, list) or not messages:
+        raise APIError(400, "`messages` must be a non-empty array.", "messages")
+    prompt = []
+    if tools and tool_choice != "none":
+        prompt.append("<|im_start|>system\nAvailable tools (JSON):\n" +
+                      json.dumps(tools, ensure_ascii=False) + "<|im_end|>\n")
+    for index, message in enumerate(messages):
+        if not isinstance(message, dict):
+            raise APIError(400, "Each message must be an object.", f"messages.{index}")
+        role = message.get("role")
+        if role == "developer":
+            role = "system"
+        if role not in ("system", "user", "assistant", "tool"):
+            raise APIError(400, f"Unsupported message role: {role!r}.",
+                           f"messages.{index}.role", "unsupported_role")
+        raw = message.get("content")
+        text = content_text(raw, f"messages.{index}.content") if raw is not None else ""
+        prompt.append(f"<|im_start|>{role}\n{text}<|im_end|>\n")
+    prompt.append("<|im_start|>assistant\n")
+    return "".join(prompt)
+
 
 def generation_options(body, limit):
     if body.get("n", 1) != 1:
@@ -642,6 +666,10 @@ class Engine:
                 self.process.wait(timeout=5)
         if self.dispatcher is not threading.current_thread():
             self.dispatcher.join(timeout=5)
+        for stream in (self.process.stdin, self.process.stdout):
+            close = getattr(stream, "close", None)
+            if callable(close):
+                close()
 
 
 def model_object(model_id, created):
@@ -653,7 +681,7 @@ class APIServer(ThreadingHTTPServer):
 
     def __init__(self, address, engine, model_id, api_key=None, max_tokens=1024,
                  cors_origins=DEFAULT_CORS_ORIGINS, max_queue=8, queue_timeout=300,
-                 kv_slots=1):
+                 kv_slots=1, chat_renderer=render_chat):
         super().__init__(address, APIHandler)
         self.engine = engine
         self.model_id = model_id
@@ -663,6 +691,7 @@ class APIServer(ThreadingHTTPServer):
         self.kv_slots = kv_slots
         self.cors_origins = tuple(cors_origins)
         self.created = int(time.time())
+        self.chat_renderer = chat_renderer
 
 
 class APIHandler(BaseHTTPRequestHandler):
@@ -1044,7 +1073,7 @@ class APIHandler(BaseHTTPRequestHandler):
         if not isinstance(enable_thinking, bool):
             raise APIError(400, "`enable_thinking` must be a boolean.", "enable_thinking")
         tools = body.get("tools") or body.get("functions") or None
-        prompt = render_chat(body.get("messages"), enable_thinking, reasoning_effort, tools,
+        prompt = self.server.chat_renderer(body.get("messages"), enable_thinking, reasoning_effort, tools,
                              body.get("tool_choice"))
         self.generation(body, prompt, request_id, True)
 
@@ -1057,7 +1086,7 @@ class APIHandler(BaseHTTPRequestHandler):
         self.generation(body, prompt, request_id, False)
 
 
-def serve(model, host="127.0.0.1", port=8000, model_id="glm-5.2-colibri", api_key=None,
+def serve(model, host="127.0.0.1", port=8000, model_id="qwen3.6-35b-a3b-colibri", api_key=None,
           cap=8, max_tokens=1024, engine=HERE / "glm", env=None, cors_origins=None,
           max_queue=8, queue_timeout=300, kv_slots=1):
     if not 1 <= max_tokens:
@@ -1073,10 +1102,18 @@ def serve(model, host="127.0.0.1", port=8000, model_id="glm-5.2-colibri", api_ke
     if host not in ("127.0.0.1", "localhost", "::1") and not api_key:
         print("WARNING: API is listening beyond localhost without COLI_API_KEY", file=sys.stderr)
     origins = DEFAULT_CORS_ORIGINS if cors_origins is None else tuple(cors_origins)
-    # Bind before starting the 744B engine. A stale/occupied port must fail in
-    # milliseconds rather than loading hundreds of GB and leaking a child.
+    renderer = render_chat
+    try:
+        cfg = json.loads((Path(model) / "config.json").read_text(encoding="utf-8"))
+        text_cfg = cfg.get("text_config", cfg)
+        if cfg.get("model_type") == "qwen3_5_moe" or text_cfg.get("model_type") == "qwen3_5_moe_text":
+            renderer = render_qwen_chat
+    except (OSError, ValueError):
+        pass
+    # Bind before starting the model engine. A stale/occupied port must fail in
+    # milliseconds rather than loading weights and leaking a child.
     server = APIServer((host, port), None, model_id, api_key, max_tokens, origins,
-                       max_queue, queue_timeout, kv_slots)
+                       max_queue, queue_timeout, kv_slots, renderer)
     runtime = None
     previous_sigterm = signal.getsignal(signal.SIGTERM)
     try:
@@ -1096,14 +1133,14 @@ def serve(model, host="127.0.0.1", port=8000, model_id="glm-5.2-colibri", api_ke
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default=os.environ.get("COLI_MODEL"), required=not os.environ.get("COLI_MODEL"))
-    parser.add_argument("--engine", default=str(HERE / "glm"))
+    parser.add_argument("--engine", default=str(HERE / "qwen36"))
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
-    parser.add_argument("--model-id", default=os.environ.get("COLI_MODEL_ID", "glm-5.2-colibri"))
+    parser.add_argument("--model-id", default=os.environ.get("COLI_MODEL_ID", "qwen3.6-35b-a3b-colibri"))
     parser.add_argument("--api-key", default=os.environ.get("COLI_API_KEY"))
     parser.add_argument("--cors-origin", action="append", default=None,
                         help="allowed browser origin; repeat as needed (use '*' for any origin)")
-    parser.add_argument("--cap", type=int, default=8)
+    parser.add_argument("--cap", type=int, default=64)
     parser.add_argument("--max-tokens", type=int, default=1024)
     parser.add_argument("--max-queue", type=int, default=int(os.environ.get("COLI_MAX_QUEUE", "8")))
     parser.add_argument("--queue-timeout", type=float,
