@@ -39,7 +39,8 @@ def analyze_model(model):
     config_path = model / "config.json"
     if not config_path.is_file():
         raise ValueError(f"missing config.json: {model}")
-    config = json.loads(config_path.read_text())
+    raw_config = json.loads(config_path.read_text())
+    config = raw_config.get("text_config", raw_config)
     shards = sorted(model.glob("*.safetensors"))
     if not shards:
         raise ValueError(f"no safetensors shards: {model}")
@@ -185,15 +186,27 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
     if ram_budget < 4 * GB:
         ram_budget = 8 * GB
     typical = info["typical_expert_bytes"]
-    layers = int(cfg.get("num_hidden_layers", 0)) + 1
-    kv_bytes = layers * context * (int(cfg.get("kv_lora_rank", 0)) +
-                                   int(cfg.get("qk_rope_head_dim", 0))) * 4
-    kv_buffer = context * int(cfg.get("num_attention_heads", 0)) * (
-        int(cfg.get("qk_nope_head_dim", 0)) + int(cfg.get("v_head_dim", 0))) * 4
-    runtime_bytes = int(1.2 * GB + 2.5 * GB + 64 * typical + kv_bytes + kv_buffer)
+    layers = int(cfg.get("num_hidden_layers", 0))
+    if cfg.get("full_attention_interval"):
+        full_layers = layers // int(cfg["full_attention_interval"])
+        kv_bytes = (full_layers * context * 2 * int(cfg.get("num_key_value_heads", 0)) *
+                    int(cfg.get("head_dim", 0)) * 4)
+        linear_layers = layers - full_layers
+        delta_state = (linear_layers * int(cfg.get("linear_num_value_heads", 0)) *
+                       int(cfg.get("linear_key_head_dim", 0)) *
+                       int(cfg.get("linear_value_head_dim", 0)) * 4)
+        kv_buffer = 0
+    else:
+        layers += 1
+        kv_bytes = layers * context * (int(cfg.get("kv_lora_rank", 0)) +
+                                       int(cfg.get("qk_rope_head_dim", 0))) * 4
+        kv_buffer = context * int(cfg.get("num_attention_heads", 0)) * (
+            int(cfg.get("qk_nope_head_dim", 0)) + int(cfg.get("v_head_dim", 0))) * 4
+        delta_state = 0
+    runtime_bytes = int(1.2 * GB + 2.5 * GB + 64 * typical + kv_bytes + kv_buffer + delta_state)
     cache_bytes = max(0, ram_budget - info["dense_bytes"] - runtime_bytes)
     per_cap = info["per_cap_bytes"]
-    configured_experts = int(cfg.get("n_routed_experts", 0))
+    configured_experts = int(cfg.get("n_routed_experts", cfg.get("num_experts", 0)))
     cap = int(cache_bytes // per_cap) if per_cap else 0
     if configured_experts:
         cap = min(cap, configured_experts)

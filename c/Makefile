@@ -131,6 +131,12 @@ endif
 all: glm$(EXE)
 
 # phony 'glm' → 'glm.exe' on Windows (so 'make glm' and 'coli build' work on every platform)
+# Dedicated CPU-only Qwen3.6 hybrid-attention engine.
+qwen36: qwen36$(EXE)
+
+qwen36$(EXE): qwen36.c st.h json.h tok.h tok_unicode.h compat.h
+	$(CC) $(CFLAGS) qwen36.c -o qwen36$(EXE) $(LDFLAGS)
+
 glm: glm$(EXE)
 
 glm$(EXE): glm.c st.h json.h tok.h tok_unicode.h compat.h grammar.h $(CUDA_OBJ) $(METAL_OBJ)
@@ -219,7 +225,7 @@ check:
 	$(MAKE) test
 
 clean:
-	rm -f olmoe$(EXE) glm$(EXE) iobench$(EXE) backend_cuda.o backend_loader.o backend_cuda_test$(EXE) backend_cuda_bench$(EXE) backend_metal.o backend_metal_test coli_cuda.dll coli_cuda.lib coli_cuda.exp $(TEST_BINS)
+	rm -f olmoe$(EXE) glm$(EXE) qwen36$(EXE) iobench$(EXE) backend_cuda.o backend_loader.o backend_cuda_test$(EXE) backend_cuda_bench$(EXE) backend_metal.o backend_metal_test coli_cuda.dll coli_cuda.lib coli_cuda.exp $(TEST_BINS)
 	rm -rf tests/__pycache__
 
-.PHONY: all glm cuda-test cuda-bench cuda-dll portable test-c test-python test check clean
+.PHONY: all glm qwen36 cuda-test cuda-bench cuda-dll portable test-c test-python test check clean
