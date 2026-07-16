@@ -112,8 +112,13 @@ class ResourcePlanTest(unittest.TestCase):
         self.assertEqual(env["COLI_CUDA"], "1")
         self.assertEqual(env["COLI_GPUS"], "1")
         self.assertEqual(env["OMP_NUM_THREADS"], str(plan["cpu"]["physical_cores"]))
-        self.assertEqual(env["OMP_PROC_BIND"], "spread")
-        self.assertEqual(env["OMP_PLACES"], "cores")
+        if sys.platform == "win32":
+            # MinGW libgomp: niente affinity su Windows, le chiavi non vanno emesse
+            self.assertNotIn("OMP_PROC_BIND", env)
+            self.assertNotIn("OMP_PLACES", env)
+        else:
+            self.assertEqual(env["OMP_PROC_BIND"], "spread")
+            self.assertEqual(env["OMP_PLACES"], "cores")
         self.assertEqual(env["PIN_GB"], env["CUDA_EXPERT_GB"])
 
         explicit_threads = environment_for_plan(plan, {"OMP_NUM_THREADS": "7",

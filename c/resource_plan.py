@@ -39,7 +39,7 @@ def analyze_model(model):
     config_path = model / "config.json"
     if not config_path.is_file():
         raise ValueError(f"missing config.json: {model}")
-    raw_config = json.loads(config_path.read_text())
+    raw_config = json.loads(config_path.read_text(encoding="utf-8"))
     config = raw_config.get("text_config", raw_config)
     shards = sorted(model.glob("*.safetensors"))
     if not shards:
@@ -117,6 +117,30 @@ def memory_available():
                 return total_kb.value * 1024
         except OSError:
             pass
+    # macOS: no /proc and not win32. Sum the reclaimable pages reported by vm_stat
+    # (free + inactive + speculative + purgeable) — the same "reclaimable without swapping"
+    # definition the C engine's compat_meminfo uses. Fall back to total RAM (never 0 on a Mac).
+    if sys.platform == "darwin":
+        try:
+            out = subprocess.run(["vm_stat"], text=True, capture_output=True, timeout=5).stdout
+            page_match = re.search(r"page size of (\d+) bytes", out)
+            page = int(page_match.group(1)) if page_match else os.sysconf("SC_PAGE_SIZE")
+            pages = 0
+            for key in ("Pages free", "Pages inactive", "Pages speculative", "Pages purgeable"):
+                match = re.search(rf"{key}:\s+(\d+)\.", out)
+                if match:
+                    pages += int(match.group(1))
+            if pages:
+                return pages * page
+        except (OSError, subprocess.SubprocessError, ValueError):
+            pass
+        try:
+            total = subprocess.run(["sysctl", "-n", "hw.memsize"], text=True,
+                                   capture_output=True, timeout=5).stdout.strip()
+            if total:
+                return int(total)
+        except (OSError, subprocess.SubprocessError, ValueError):
+            pass
     return 0
 
 
@@ -128,8 +152,9 @@ def discover_gpus():
     except (OSError, subprocess.SubprocessError):
         return []
     devices = []
-    for line in result.stdout.splitlines():
-        fields = [field.strip() for field in line.split(",", 3)]
+    import csv
+    for fields in csv.reader(result.stdout.splitlines()):
+        fields = [f.strip() for f in fields]
         if len(fields) != 4:
             continue
         try:
@@ -143,6 +168,30 @@ def discover_gpus():
 
 
 def physical_cpu_count():
+    if sys.platform == "win32":
+        # os.cpu_count() conta i processori logici (SMT): 2 thread/core saturano
+        # le unita' AVX-512 e peggiorano il matmul. Contiamo i core fisici veri
+        # con GetLogicalProcessorInformationEx(RelationProcessorCore).
+        try:
+            import ctypes
+            k32 = ctypes.windll.kernel32
+            need = ctypes.c_ulong(0)
+            k32.GetLogicalProcessorInformationEx(0, None, ctypes.byref(need))
+            buf = (ctypes.c_char * need.value)()
+            if k32.GetLogicalProcessorInformationEx(0, buf, ctypes.byref(need)):
+                raw, cores, off = bytes(buf), 0, 0
+                while off + 8 <= need.value:
+                    relationship = int.from_bytes(raw[off:off + 4], "little")
+                    size = int.from_bytes(raw[off + 4:off + 8], "little")
+                    if size <= 0:
+                        break
+                    if relationship == 0:  # RelationProcessorCore
+                        cores += 1
+                    off += size
+                if cores:
+                    return cores
+        except (OSError, ValueError, AttributeError):
+            pass
     try:
         result = subprocess.run(["lscpu", "-p=core,socket"], text=True,
                                 capture_output=True, check=True, timeout=5)
@@ -186,27 +235,28 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
     if ram_budget < 4 * GB:
         ram_budget = 8 * GB
     typical = info["typical_expert_bytes"]
-    layers = int(cfg.get("num_hidden_layers", 0))
-    if cfg.get("full_attention_interval"):
-        full_layers = layers // int(cfg["full_attention_interval"])
-        kv_bytes = (full_layers * context * 2 * int(cfg.get("num_key_value_heads", 0)) *
-                    int(cfg.get("head_dim", 0)) * 4)
+    layers = int(cfg.get("num_hidden_layers") or 0)
+    full_attention_interval = int(cfg.get("full_attention_interval") or 0)
+    if full_attention_interval:
+        full_layers = layers // full_attention_interval
+        kv_bytes = (full_layers * context * 2 * int(cfg.get("num_key_value_heads") or 0) *
+                    int(cfg.get("head_dim") or 0) * 4)
         linear_layers = layers - full_layers
-        delta_state = (linear_layers * int(cfg.get("linear_num_value_heads", 0)) *
-                       int(cfg.get("linear_key_head_dim", 0)) *
-                       int(cfg.get("linear_value_head_dim", 0)) * 4)
+        delta_state = (linear_layers * int(cfg.get("linear_num_value_heads") or 0) *
+                       int(cfg.get("linear_key_head_dim") or 0) *
+                       int(cfg.get("linear_value_head_dim") or 0) * 4)
         kv_buffer = 0
     else:
         layers += 1
-        kv_bytes = layers * context * (int(cfg.get("kv_lora_rank", 0)) +
-                                       int(cfg.get("qk_rope_head_dim", 0))) * 4
-        kv_buffer = context * int(cfg.get("num_attention_heads", 0)) * (
-            int(cfg.get("qk_nope_head_dim", 0)) + int(cfg.get("v_head_dim", 0))) * 4
+        kv_bytes = layers * context * (int(cfg.get("kv_lora_rank") or 0) +
+                                       int(cfg.get("qk_rope_head_dim") or 0)) * 4
+        kv_buffer = context * int(cfg.get("num_attention_heads") or 0) * (
+            int(cfg.get("qk_nope_head_dim") or 0) + int(cfg.get("v_head_dim") or 0)) * 4
         delta_state = 0
     runtime_bytes = int(1.2 * GB + 2.5 * GB + 64 * typical + kv_bytes + kv_buffer + delta_state)
     cache_bytes = max(0, ram_budget - info["dense_bytes"] - runtime_bytes)
     per_cap = info["per_cap_bytes"]
-    configured_experts = int(cfg.get("n_routed_experts", cfg.get("num_experts", 0)))
+    configured_experts = int(cfg.get("n_routed_experts") or cfg.get("num_experts") or 0)
     cap = int(cache_bytes // per_cap) if per_cap else 0
     if configured_experts:
         cap = min(cap, configured_experts)
@@ -277,8 +327,11 @@ def environment_for_plan(plan, env=None, cuda_enabled=True):
     result = dict(env or {})
     result.setdefault("COLI_POLICY", plan["policy"]["name"])
     result.setdefault("OMP_NUM_THREADS", str(plan["cpu"]["physical_cores"]))
-    result.setdefault("OMP_PROC_BIND", "spread")
-    result.setdefault("OMP_PLACES", "cores")
+    if sys.platform != "win32":
+        # la libgomp di MinGW non supporta l'affinity su Windows
+        # ("Affinity not supported on this configuration"): non impostarle li'.
+        result.setdefault("OMP_PROC_BIND", "spread")
+        result.setdefault("OMP_PLACES", "cores")
     if plan["policy"]["name"] == "balanced":
         result.setdefault("REPIN", "64")
     ram = plan["tiers"]["ram"]

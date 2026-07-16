@@ -7,6 +7,7 @@ import collections
 import contextlib
 import json
 import math
+import mimetypes
 import os
 import select
 import queue
@@ -27,6 +28,8 @@ END = b"\x01\x01END\x01\x01\n"
 READY = b"\x01\x01READY\x01\x01\n"
 MAX_BODY = 4 << 20
 DEFAULT_CORS_ORIGINS = (
+    "http://127.0.0.1:8000",
+    "http://localhost:8000",
     "http://127.0.0.1:5173",
     "http://localhost:5173",
     "http://tauri.localhost",
@@ -431,8 +434,11 @@ def generation_options(body, limit):
     top_p = body.get("top_p")
     temperature = 0.7 if temperature is None else temperature
     top_p = 0.9 if top_p is None else top_p
-    if isinstance(maximum, bool) or not isinstance(maximum, int) or not 1 <= maximum <= limit:
-        raise APIError(400, f"`{maximum_param}` must be an integer between 1 and {limit}.", maximum_param)
+    if isinstance(maximum, bool) or not isinstance(maximum, int) or maximum < 1:
+        raise APIError(400, f"`{maximum_param}` must be a positive integer.", maximum_param)
+    if maximum > limit:
+        maximum = limit   # clamp to the server's --max-tokens cap instead of 400 (#260): OpenAI
+                          # clients (opencode/ai-sdk) default to large max_tokens; rejecting breaks them.
     if (isinstance(temperature, bool) or not isinstance(temperature, (int, float)) or
             not math.isfinite(temperature) or not 0 <= temperature <= 2):
         raise APIError(400, "`temperature` must be between 0 and 2.", "temperature")
@@ -486,6 +492,11 @@ class Engine:
         self.closed = False
         self.dispatcher_error = None
         self.kv_slots = kv_slots
+        self.tiers = None
+        self.hwinfo = None
+        self.emap = None
+        self.hits = None
+        self.hits_seq = 0                      # latest "TIERS" snapshot from the engine
         read_engine_turn(self.process.stdout, READY, lambda _: None)
         self.dispatcher = threading.Thread(target=self._dispatch_stdout,
                                            name="colibri-stdout", daemon=True)
@@ -551,6 +562,22 @@ class Engine:
                         events = self.pending.pop(request_id, None)
                     if events is not None:
                         events.put(("done", stats))
+                elif kind == "HWINFO" and len(fields) >= 7:
+                    parts = " ".join(fields[6:]).split("|")
+                    self.hwinfo = {"cores": int(fields[1]), "ram_total_gb": float(fields[2]),
+                                   "ram_avail_gb": float(fields[3]), "gpus": int(fields[4]),
+                                   "vram_total_gb": float(fields[5]),
+                                   "cpu": parts[0].strip() if len(parts)>0 else "",
+                                   "gpu": parts[1].strip() if len(parts)>1 else ""}
+                elif kind == "EMAP" and len(fields) == 4:
+                    self.emap = {"rows": int(fields[1]), "cols": int(fields[2]), "map": fields[3]}
+                elif kind == "HITS" and len(fields) == 4:
+                    self.hits = fields[3]
+                    self.hits_seq += 1
+                elif kind == "TIERS" and len(fields) >= 6:
+                    self.tiers = {"vram": int(fields[1]), "ram": int(fields[2]),
+                                  "disk": int(fields[3]), "vram_gb": float(fields[4]),
+                                  "ram_gb": float(fields[5])}
                 elif kind == "ERROR" and len(fields) >= 2:
                     request_id = fields[1]
                     message = " ".join(fields[2:]) or "engine request failed"
@@ -701,9 +728,13 @@ class APIHandler(BaseHTTPRequestHandler):
             self.send_header("Vary", "Origin")
 
     def require_auth(self):
-        if self.server.api_key and self.headers.get("Authorization") != f"Bearer {self.server.api_key}":
-            raise APIError(401, "Invalid or missing API key.", None, "invalid_api_key",
-                           "authentication_error")
+        if self.server.api_key:
+            import hmac
+            provided = self.headers.get("Authorization", "")
+            expected = f"Bearer {self.server.api_key}"
+            if not hmac.compare_digest(provided, expected):
+                raise APIError(401, "Invalid or missing API key.", None, "invalid_api_key",
+                               "authentication_error")
 
     def read_json(self):
         try:
@@ -725,13 +756,62 @@ class APIHandler(BaseHTTPRequestHandler):
         if model != self.server.model_id:
             raise APIError(404, f"The model `{model}` does not exist.", "model", "model_not_found")
 
+    WEB_DIST = Path(__file__).resolve().parent.parent / "web" / "dist"
+
+    def serve_static(self, path):
+        """Serve the built web UI (web/dist) so `coli web` is one process.
+        Read-only, no auth (same trust level as /health), traversal-safe."""
+        if path.startswith("/v1/") or path == "/health":
+            return False
+        base = self.WEB_DIST.resolve()
+        if not base.is_dir():
+            return False
+        rel = unquote(path).lstrip("/") or "index.html"
+        target = (base / rel).resolve()
+        try:
+            target.relative_to(base)
+        except ValueError:
+            target = None
+        if target is None or not target.is_file():
+            if path == "/" or "." not in rel:      # SPA fallback
+                target = base / "index.html"
+                if not target.is_file():
+                    return False
+            else:
+                return False
+        ctype = mimetypes.guess_type(str(target))[0] or "application/octet-stream"
+        data = target.read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_cors_headers()
+        self.end_headers()
+        self.wfile.write(data)
+        return True
+
     def do_GET(self):
         request_id = "req_" + uuid.uuid4().hex
         try:
             path = urlsplit(self.path).path
             if path == "/health":
-                self.send_json(200, {"status": "ok", "scheduler": self.server.scheduler.snapshot(),
-                                     "kv_slots": self.server.kv_slots}, request_id)
+                payload = {"status": "ok", "scheduler": self.server.scheduler.snapshot(),
+                           "kv_slots": self.server.kv_slots}
+                tiers = getattr(self.server.engine, "tiers", None) if self.server.engine else None
+                if tiers: payload["tiers"] = tiers
+                hwinfo = getattr(self.server.engine, "hwinfo", None) if self.server.engine else None
+                if hwinfo: payload["hwinfo"] = hwinfo
+                self.send_json(200, payload, request_id)
+                return
+            if path == "/experts":
+                eng = self.server.engine
+                payload = {"rows": 0, "cols": 0, "map": "", "hits": "", "seq": 0}
+                if eng and getattr(eng, "emap", None):
+                    payload.update(eng.emap)
+                    payload["hits"] = eng.hits or ""
+                    payload["seq"] = eng.hits_seq
+                self.send_json(200, payload, request_id)
+                return
+            if self.serve_static(path):
                 return
             self.require_auth()
             if path == "/v1/models":
@@ -779,6 +859,16 @@ class APIHandler(BaseHTTPRequestHandler):
                 pass
 
     def generation(self, body, prompt, request_id, chat):
+        # COLI_DEBUG tees the engine transaction to stderr: 1 = decoded output stream only,
+        # 2 = both sides (rendered prompt + output). render_chat already folds prior turns and
+        # tool results into `prompt`, so level 2 is the full conversation the engine saw.
+        try:
+            dbg = int(os.environ.get("COLI_DEBUG", "0"))
+        except ValueError:
+            dbg = 0
+        if dbg >= 2:
+            sys.stderr.write(f"\n===== PROMPT [{request_id}] =====\n{prompt}\n===== OUTPUT [{request_id}] =====\n")
+            sys.stderr.flush()
         maximum, temperature, top_p = generation_options(body, self.server.max_tokens)
         tools = (body.get("tools") or body.get("functions") or None) if chat else None
         if body.get("tool_choice") == "none":
@@ -848,7 +938,7 @@ class APIHandler(BaseHTTPRequestHandler):
             last_write = [time.time()]
             ka_stop = threading.Event()
             KA_GAP = 10.0
-            dbg_echo = os.environ.get("COLI_DEBUG", "0") == "1"   # tee decoded tokens to stderr
+            dbg_echo = dbg >= 1   # tee decoded tokens to stderr (COLI_DEBUG level parsed in generation())
 
             def event(choices, usage_marker=False):
                 nonlocal connected
@@ -991,6 +1081,8 @@ class APIHandler(BaseHTTPRequestHandler):
         prompt = body.get("prompt")
         if not isinstance(prompt, str):
             raise APIError(400, "Colibri currently requires `prompt` to be a string.", "prompt")
+        if not prompt:
+            raise APIError(400, "`prompt` must not be empty.", "prompt")
         self.generation(body, prompt, request_id, False)
 
 
@@ -1041,14 +1133,14 @@ def serve(model, host="127.0.0.1", port=8000, model_id="qwen3.6-35b-a3b-colibri"
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default=os.environ.get("COLI_MODEL"), required=not os.environ.get("COLI_MODEL"))
-    parser.add_argument("--engine", default=str(HERE / "glm"))
+    parser.add_argument("--engine", default=str(HERE / "qwen36"))
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
-    parser.add_argument("--model-id", default=os.environ.get("COLI_MODEL_ID", "glm-5.2-colibri"))
+    parser.add_argument("--model-id", default=os.environ.get("COLI_MODEL_ID", "qwen3.6-35b-a3b-colibri"))
     parser.add_argument("--api-key", default=os.environ.get("COLI_API_KEY"))
     parser.add_argument("--cors-origin", action="append", default=None,
                         help="allowed browser origin; repeat as needed (use '*' for any origin)")
-    parser.add_argument("--cap", type=int, default=8)
+    parser.add_argument("--cap", type=int, default=64)
     parser.add_argument("--max-tokens", type=int, default=1024)
     parser.add_argument("--max-queue", type=int, default=int(os.environ.get("COLI_MAX_QUEUE", "8")))
     parser.add_argument("--queue-timeout", type=float,

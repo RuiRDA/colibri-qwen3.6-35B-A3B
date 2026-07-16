@@ -206,9 +206,8 @@ cd c
 python -m unittest discover -s tests
 ```
 
-The last full validation during development passed 65 tests with one expected
-Windows permission-mode skip. The publishing branch is revalidated before it
-is merged.
+The post-merge validation passed 74 tests with four expected platform/toolchain
+skips on Windows.
 
 ## Tuning notes
 
